@@ -8,6 +8,8 @@ use crate::tone::{self, Channel};
 
 const MIC_TEST_SECONDS: f32 = 3.0;
 const LEVEL_BAR_WIDTH: usize = 30;
+/// Recordings peaking below this are reported as nearly silent.
+const QUIET_DBFS: f32 = -50.0;
 
 pub fn run(cli: Cli) -> Result<()> {
     match (cli.command, cli.number) {
@@ -119,7 +121,7 @@ fn mic_status() -> Result<()> {
 
 fn mic_test() -> Result<()> {
     let mut backend = Backend::connect()?;
-    let (_, card) = current_bluetooth_card(&mut backend)?;
+    let (sink, card) = current_bluetooth_card(&mut backend)?;
     if card.mode() != Some(Mode::Headset) {
         return Err(Error::MicOff);
     }
@@ -128,25 +130,38 @@ fn mic_test() -> Result<()> {
         .into_iter()
         .find(|d| d.card == Some(card.index))
         .ok_or(Error::MicOff)?;
-    // Recording captures the default input, so make sure it is the Bluetooth microphone.
-    backend.set_default_source(&mic.name)?;
-    let name = mic.description;
     drop(backend);
 
-    println!("🎤 Recording {MIC_TEST_SECONDS}s from {name}... speak now");
-    let samples = tone::record(MIC_TEST_SECONDS, |rms| {
-        let filled = (tone::level(rms) * LEVEL_BAR_WIDTH as f32).round() as usize;
-        print!(
-            "\r   [{}{}]",
-            "#".repeat(filled),
-            " ".repeat(LEVEL_BAR_WIDTH - filled)
-        );
-        let _ = io::stdout().flush();
-    })?;
-    println!();
-
-    println!("🔊 Playing back...");
-    tone::play_mono(&samples)
+    println!(
+        "🎤 Recording {MIC_TEST_SECONDS}s from {}... speak now",
+        mic.description
+    );
+    tone::record_and_play(
+        &mic.name,
+        &sink.name,
+        MIC_TEST_SECONDS,
+        |rms| {
+            let filled = (tone::level(rms) * LEVEL_BAR_WIDTH as f32).round() as usize;
+            print!(
+                "\r   [{}{}]",
+                "#".repeat(filled),
+                " ".repeat(LEVEL_BAR_WIDTH - filled)
+            );
+            let _ = io::stdout().flush();
+        },
+        |samples| {
+            println!();
+            let peak = tone::dbfs(tone::peak(samples));
+            let rms = tone::dbfs(tone::rms(samples));
+            println!("   peak {peak:.1} dBFS · rms {rms:.1} dBFS");
+            if peak < QUIET_DBFS {
+                println!("⚠️  Almost nothing was recorded");
+            }
+            // Headset microphones record quietly, so play the recording back at full level.
+            tone::normalize(samples);
+            println!("🔊 Playing back...");
+        },
+    )
 }
 
 fn test(left: bool, right: bool) -> Result<()> {

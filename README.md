@@ -63,6 +63,8 @@ $ audio mic off
 - Switching output always returns Bluetooth devices to A2DP, so a device is never left in call quality.
 - `audio mic on|off|status|test` fails with an error when the current output is not a Bluetooth device.
 - `audio mic test` fails with an error when the Bluetooth microphone is off.
+- `audio mic test` keeps the headset output open (playing silence) while it records, prints the recorded
+  peak and RMS level, and plays the recording back normalized to full level.
 
 ### Why is the Bluetooth microphone optional?
 
@@ -110,6 +112,8 @@ Versioning: new features bump the minor version, bug fixes bump the patch versio
 
 ## Known issues
 
-- On some USB Bluetooth adapters (seen with a Realtek RTL8761BU), the headset microphone records near silence
-  and the kernel logs `corrupted SCO packet`. This is a driver / adapter issue below `audio`; recording with
-  `pw-record` shows the same result.
+- On some USB Bluetooth adapters (seen with a Realtek RTL8761BU), the headset's SCO link drops a few seconds
+  into a recording when nothing is playing to the headset, and the kernel logs `corrupted SCO packet`.
+  Everything recorded after that is silence. `audio mic test` works around this by playing silence while it
+  records; other record-only tools such as `pw-record` are still affected. Calls are fine, since they play and
+  record at the same time.

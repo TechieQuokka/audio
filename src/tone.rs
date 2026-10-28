@@ -1,5 +1,8 @@
 use std::f32::consts::TAU;
+use std::sync::mpsc::{self, TryRecvError};
+use std::thread;
 
+use libpulse_binding::def::BufferAttr;
 use libpulse_binding::sample::{Format, Spec};
 use libpulse_binding::stream::Direction;
 use libpulse_simple_binding::Simple;
@@ -12,6 +15,12 @@ pub const RATE: u32 = 48_000;
 const AMPLITUDE: f32 = 0.3;
 /// Length of each recorded chunk, which is also how often the level is reported.
 const CHUNK_SECONDS: f32 = 0.1;
+/// Length of each block of silence written while the microphone test records.
+const KEEP_ALIVE_SECONDS: f32 = 0.05;
+/// Peak level recordings are normalized to before playback (-1 dBFS).
+const PLAYBACK_PEAK: f32 = 0.89;
+/// Normalizing never amplifies by more than this (+30 dB), so silence stays quiet.
+const MAX_GAIN: f32 = 31.6;
 
 /// Length of one sixteenth note.
 const STEP_SECONDS: f32 = 0.15;
@@ -145,7 +154,7 @@ fn render(route: impl Fn(u16) -> Channel) -> Vec<f32> {
         }
     }
 
-    let peak = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    let peak = peak(&out);
     if peak > 0.0 {
         out.iter_mut().for_each(|s| *s *= AMPLITUDE / peak);
     }
@@ -160,7 +169,7 @@ fn split_frame() -> usize {
 /// Plays the melody on one channel, or with the first phrase on the left and the second on the right.
 /// `announce` is called as each channel starts playing.
 pub fn play_melody(channel: Option<Channel>, mut announce: impl FnMut(Channel)) -> Result<()> {
-    let stream = open(Direction::Playback, 2, "test tone")?;
+    let stream = open(Direction::Playback, 2, "test tone", None, None)?;
     match channel {
         Some(channel) => {
             announce(channel);
@@ -194,26 +203,95 @@ pub fn rms(samples: &[f32]) -> f32 {
     (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
 }
 
+pub fn peak(samples: &[f32]) -> f32 {
+    samples.iter().fold(0.0f32, |m, s| m.max(s.abs()))
+}
+
+/// Converts an amplitude to dBFS; silence is negative infinity.
+pub fn dbfs(amplitude: f32) -> f32 {
+    20.0 * amplitude.log10()
+}
+
 /// Maps an RMS value to 0.0..=1.0 on a -60 dBFS..0 dBFS scale.
 pub fn level(rms: f32) -> f32 {
     if rms <= 0.0 {
         return 0.0;
     }
-    ((20.0 * rms.log10() + 60.0) / 60.0).clamp(0.0, 1.0)
+    ((dbfs(rms) + 60.0) / 60.0).clamp(0.0, 1.0)
 }
 
-pub fn play_mono(samples: &[f32]) -> Result<()> {
-    let stream = open(Direction::Playback, 1, "microphone playback")?;
-    stream.write(&to_bytes(samples))?;
-    stream.drain()?;
-    Ok(())
+/// Scales samples so their peak reaches -1 dBFS, amplifying by at most +30 dB.
+pub fn normalize(samples: &mut [f32]) {
+    let peak = peak(samples);
+    if peak > 0.0 {
+        let gain = (PLAYBACK_PEAK / peak).min(MAX_GAIN);
+        samples.iter_mut().for_each(|s| *s *= gain);
+    }
 }
 
-/// Records from the default input, calling `on_level` with each chunk's RMS.
-pub fn record(seconds: f32, mut on_level: impl FnMut(f32)) -> Result<Vec<f32>> {
-    let stream = open(Direction::Record, 1, "microphone test")?;
-    let total = (seconds * RATE as f32) as usize;
-    let chunk = (CHUNK_SECONDS * RATE as f32) as usize;
+/// Records from `source` and plays the recording back on `sink`.
+///
+/// The playback stream is opened first and plays silence for the whole recording:
+/// some Bluetooth adapters drop a headset's SCO link after a few seconds of recording
+/// alone, and reopening playback afterwards loses its start.
+/// `on_level` is called with each chunk's RMS, and `on_recorded` may inspect or
+/// change the recording before it is played.
+pub fn record_and_play(
+    source: &str,
+    sink: &str,
+    seconds: f32,
+    mut on_level: impl FnMut(f32),
+    on_recorded: impl FnOnce(&mut [f32]),
+) -> Result<()> {
+    let (send, receive) = mpsc::channel::<Vec<f32>>();
+    thread::scope(|scope| {
+        let player = scope.spawn(move || -> Result<()> {
+            let keep_alive = frames(KEEP_ALIVE_SECONDS);
+            let attr = buffer_attr(keep_alive);
+            let stream = open(
+                Direction::Playback,
+                1,
+                "microphone playback",
+                Some(sink),
+                Some(&attr),
+            )?;
+            let silence = to_bytes(&vec![0.0; keep_alive]);
+            let samples = loop {
+                match receive.try_recv() {
+                    Ok(samples) => break samples,
+                    // Blocks until the server has room, which paces the loop.
+                    Err(TryRecvError::Empty) => stream.write(&silence)?,
+                    Err(TryRecvError::Disconnected) => return Ok(()),
+                }
+            };
+            stream.write(&to_bytes(&samples))?;
+            stream.drain()?;
+            Ok(())
+        });
+
+        let recorded = record(source, seconds, &mut on_level).map(|mut samples| {
+            on_recorded(&mut samples);
+            // The player only hangs up on its own errors, which `join` reports.
+            let _ = send.send(samples);
+        });
+        drop(send);
+        let played = player.join().expect("playback thread panicked");
+        recorded.and(played)
+    })
+}
+
+/// Records from `source`, calling `on_level` with each chunk's RMS.
+fn record(source: &str, seconds: f32, on_level: &mut impl FnMut(f32)) -> Result<Vec<f32>> {
+    let chunk = frames(CHUNK_SECONDS);
+    let attr = buffer_attr(chunk);
+    let stream = open(
+        Direction::Record,
+        1,
+        "microphone test",
+        Some(source),
+        Some(&attr),
+    )?;
+    let total = frames(seconds);
     let mut samples = Vec::with_capacity(total);
     let mut buffer = vec![0u8; chunk * size_of::<f32>()];
     while samples.len() < total {
@@ -226,7 +304,14 @@ pub fn record(seconds: f32, mut on_level: impl FnMut(f32)) -> Result<Vec<f32>> {
     Ok(samples)
 }
 
-fn open(direction: Direction, channels: u8, stream_name: &str) -> Result<Simple> {
+/// Opens a stream on `device`, or on the default device when it is `None`.
+fn open(
+    direction: Direction,
+    channels: u8,
+    stream_name: &str,
+    device: Option<&str>,
+    attr: Option<&BufferAttr>,
+) -> Result<Simple> {
     let spec = Spec {
         format: Format::FLOAT32NE,
         channels,
@@ -236,12 +321,28 @@ fn open(direction: Direction, channels: u8, stream_name: &str) -> Result<Simple>
         None,
         APP_NAME,
         direction,
-        None,
+        device,
         stream_name,
         &spec,
         None,
-        None,
+        attr,
     )?)
+}
+
+fn frames(seconds: f32) -> usize {
+    (seconds * RATE as f32) as usize
+}
+
+/// Buffers of about `frames` mono samples for a responsive stream; the rest is left to the server.
+fn buffer_attr(frames: usize) -> BufferAttr {
+    let bytes = (frames * size_of::<f32>()) as u32;
+    BufferAttr {
+        maxlength: u32::MAX,
+        tlength: bytes,
+        prebuf: u32::MAX,
+        minreq: u32::MAX,
+        fragsize: bytes,
+    }
 }
 
 fn to_bytes(samples: &[f32]) -> Vec<u8> {
@@ -340,6 +441,35 @@ mod tests {
         assert_eq!(level(1.0), 1.0);
         assert!((level(0.001) - 0.0).abs() < 1e-6); // -60 dBFS
         assert!((level(0.0316) - 0.5).abs() < 0.01); // about -30 dBFS
+    }
+
+    #[test]
+    fn dbfs_of_known_amplitudes() {
+        assert_eq!(dbfs(1.0), 0.0);
+        assert!((dbfs(0.1) + 20.0).abs() < 1e-4);
+        assert_eq!(dbfs(0.0), f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn normalize_raises_peak_to_target() {
+        let mut samples = [0.05, -0.1, 0.02];
+        normalize(&mut samples);
+        assert!((peak(&samples) - PLAYBACK_PEAK).abs() < 1e-6);
+        assert!((samples[0] / samples[1] + 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn normalize_limits_gain() {
+        let mut samples = [0.001, -0.0005];
+        normalize(&mut samples);
+        assert!((peak(&samples) - 0.001 * MAX_GAIN).abs() < 1e-6);
+    }
+
+    #[test]
+    fn normalize_leaves_silence_alone() {
+        let mut samples = [0.0; 4];
+        normalize(&mut samples);
+        assert_eq!(samples, [0.0; 4]);
     }
 
     #[test]
